@@ -1,0 +1,275 @@
+#pragma kernel convertBoundary
+#pragma kernel prologue
+#pragma kernel clearCell
+#pragma kernel findNeighbors
+#pragma kernel computeLambdas
+#pragma kernel computeDeltaPos
+#pragma kernel applyDeltaPos
+#pragma kernel advectAttribute
+#pragma kernel epilogue
+
+#include "UnityCG.cginc"
+ 
+#define PI 3.14159265358979323846f
+#define POLY6_FACTOR (315.0f)/(64.0f*PI)
+#define SPIKY_GRAD_FACTOR (-45.0f)/(PI)
+#define SPIKY_LAP_FACTOR (-90.0f)/(PI)
+#define NUM_THREADS_X 128
+#define LAMBDA_EPSILON 100.0f
+#define CORRK 0.001f
+#define EPSILON 1e-5
+
+float timePassed;
+float4x4 matrices[6];
+float4 boundaryMin,boundaryMax,gravity;
+int hashTableSize;
+float cellSize;
+float timeStep;
+float particleRadius;
+float supprotRadius;
+float neighborSearchRadius;
+float meltingPoint;
+float rho0;
+float tConductRate;
+int maxNumInCell,maxNumNeighbor,particleNum,maxRhoIndex;
+int MELTING_SOLID_ID;
+
+struct Particle
+{
+    float4 pos,vel,posLast,posDelta;
+    int id,matrixIndex;
+    float lambda,lastTemperature,temperature;
+    float rho,pad0,pad1;
+};
+
+RWStructuredBuffer<Particle> particles;
+RWStructuredBuffer<int> nIndices; // neighbor indices  for particle i
+RWStructuredBuffer<int> nNum;     // neighbor number for particle is
+
+RWStructuredBuffer<int> numInCell;
+RWStructuredBuffer<int> indicesInCell;
+
+float random(float2 p){return frac(cos(dot(p,float2(23.14069263277926,2.665144142690225)))*12345.6789);}
+float3 random3(float2 p){return  normalize(float3(random(p),random(p*9.876543f),random(p*73.3241)));}
+int hash(int3 p){return  (((73856093*p.x)^(19349663*p.y)^(83492791*p.z))%hashTableSize+hashTableSize)%hashTableSize ; }
+
+float poly6(float r,float h)
+{
+    float ret = 0.0f;
+    if(r>0.0f && r<h){
+        float x = (h*h-r*r)/(h*h*h);
+        ret =  POLY6_FACTOR* x*x*x ;
+    }
+    return ret;
+}
+
+float spikyLaplace(float r,float h)
+{
+    float ret = 0.0f;
+    if(r>0.0f && r<h)
+        ret =  SPIKY_LAP_FACTOR*(r/h-1)/(h*h*h*h*h) ;
+    return ret;
+}
+float4 spikyGrad(float4 r,float h)
+{
+    float4 ret = float4(0.0f,0.0f,0.0f,0.0f);
+    float rlen = length(r.xyz);
+    if(0.0f<rlen && rlen<h){
+        float x = (h-rlen)/(h*h*h);
+        ret = (SPIKY_GRAD_FACTOR/rlen)*x*x*r;
+    }
+    ret.w=1.0f;
+    return ret;    
+}
+
+float computeScorr(float4 posJI,float h)
+{
+    float x = poly6(length(posJI.xyz),h)/ poly6(0.3*h,h); 
+    x = x*x;
+    x = x*x;
+    return (-CORRK)*x;
+}
+
+float4 confinePosToBoundary(float4 pos)
+{   
+    float zBound = boundaryMax.z+ 5* (sin(timePassed)-1);
+    if(pos.x < boundaryMin.x)
+        pos.x = boundaryMin.x + random(pos.yz)*EPSILON;
+    else if(pos.x > boundaryMax.x )
+        pos.x = boundaryMax.x  - random(pos.yz)*EPSILON;
+    if(pos.y < boundaryMin.y)
+        pos.y = boundaryMin.y+random(pos.xz)*EPSILON;
+    else if(pos.y > boundaryMax.y )
+        pos.y = boundaryMax.y  - random(pos.xz)*EPSILON;
+    if(pos.z < boundaryMin.z)
+        pos.z = boundaryMin.z+random(pos.xy)*EPSILON;
+    else if(pos.z > zBound)
+        pos.z = zBound - random(pos.xy)*EPSILON;
+    return pos;
+}
+
+[numthreads(NUM_THREADS_X,1,1)]
+void convertBoundary(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if(i>=particleNum||particles[i].id <= MELTING_SOLID_ID) return;
+    particles[i].pos = mul(matrices[particles[i].matrixIndex],particles[i].posLast);
+}
+
+//clear hash table
+[numthreads(NUM_THREADS_X,1,1)]
+void clearCell(uint3 id : SV_DispatchThreadID)
+{
+    numInCell[id.x]=0;
+}
+
+[numthreads(NUM_THREADS_X,1,1)]
+void prologue(uint3 id : SV_DispatchThreadID)
+{
+    // 注意 i 可能大于 particle Number 越界返回零
+    uint i = id.x;  
+    if(i>=particleNum) return;
+    //melting solid particle
+    if(particles[i].id == MELTING_SOLID_ID &&particles[i].temperature>meltingPoint)
+        particles[i].id = 0;
+    // predict positions
+    if(particles[i].id < MELTING_SOLID_ID){
+        float4 pos_i = particles[i].pos;
+        float4 vel_i = particles[i].vel;
+        vel_i = vel_i + timeStep*gravity;
+        pos_i = pos_i + timeStep*vel_i;
+        particles[i].pos = confinePosToBoundary(pos_i);
+    }
+
+    // update grid
+    int oldValue,cellIndex = hash(int3(particles[i].pos.xyz/cellSize));
+    InterlockedAdd(numInCell[cellIndex],1,oldValue);
+    indicesInCell[cellIndex*maxNumInCell+oldValue] = i;
+}
+
+[numthreads(NUM_THREADS_X,1,1)]
+void findNeighbors(uint3 id : SV_DispatchThreadID)
+{
+    int neighborCnt = 0;
+    int i = id.x;
+    if(i>=particleNum || particles[i].id >= MELTING_SOLID_ID) return;
+    float4 pos_i = particles[i].pos;
+    int3 idx = int3(pos_i.xyz/cellSize);
+    int cellIndex = hash(idx.xyz);
+    for(int ii =-1;ii<2;ii++)
+        for(int jj =-1;jj<2;jj++)
+            for(int kk =-1;kk<2;kk++)
+            {
+                int neighborCellIndex = hash(idx+int3(ii,jj,kk)); //任何越界访问会返回0,无需x越界检测
+                for(int j=0;j<numInCell[neighborCellIndex];j++)
+                {
+                    int neighborParticleIndex = indicesInCell[neighborCellIndex*maxNumInCell+j];
+                    float4 pos_j = particles[neighborParticleIndex].pos;
+                    if(length((pos_i-pos_j).xyz) < neighborSearchRadius && i!=neighborParticleIndex && neighborCnt<maxNumNeighbor)
+                    {
+                        nIndices[i*maxNumNeighbor+neighborCnt] = neighborParticleIndex;
+                        neighborCnt+=1;
+                    }
+                }
+            }
+    nNum[i] = neighborCnt;
+}
+
+[numthreads(NUM_THREADS_X,1,1)]
+void computeLambdas(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    if(i>=particleNum||particles[i].id>=MELTING_SOLID_ID) return;
+    float4 posI = particles[i].pos; 
+    float gradSqrSum = 0.0f;
+    float4 gradI = float4(0.0f,0.0f,0.0f,0.0f);
+    float rhoI = 0.0f;
+    for(int j = 0;j<nNum[i];j++)
+    {
+        int pj = nIndices[i*maxNumNeighbor+j];
+        float4 posJ = particles[pj].pos;
+        float4 posJI = posI - posJ;
+        float4 gradJ = spikyGrad(posJI,supprotRadius)/rho0;
+        gradSqrSum += dot(gradJ.xyz,gradJ.xyz);
+        gradI += gradJ;
+        float scl = 1.0f;
+        //if(particles[pj].id>MELTING_SOLID_ID) scl = 2.0f;
+        rhoI += scl*poly6(length(posJI.xyz),supprotRadius);
+    }
+    float CI = rhoI/rho0-1.0f;
+    gradSqrSum += dot(gradI.xyz,gradI.xyz);
+    particles[i].lambda = (-CI)/(gradSqrSum+LAMBDA_EPSILON);
+    particles[i].rho = rhoI;  
+}
+[numthreads(NUM_THREADS_X,1,1)]
+void computeDeltaPos(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    if(i>=particleNum||particles[i].id>=MELTING_SOLID_ID) return;
+    float4 posI = particles[i].pos;
+    float lambdaI = particles[i].lambda;
+    float4 deltaPosI = float4(0.0f,0.0f,0.0f,0.0f);
+    float distanceConstrain = 2*particleRadius;
+    for(int jj = 0;jj<nNum[i];jj++)
+    {
+        int j = nIndices[i*maxNumNeighbor+jj];
+        float lambdaJ = particles[j].lambda;
+        float4 posJ = particles[j].pos;
+        float4 posJI = posI - posJ;
+        float factor = lambdaI;
+        if(particles[j].id < MELTING_SOLID_ID )
+            factor += (lambdaJ+ computeScorr(posJI,supprotRadius));
+        else if(length(posJI.xyz)<distanceConstrain)
+            deltaPosI += posJI*(distanceConstrain/length(posJI.xyz)-1.0f)*0.5f; // solid fluid collision
+        deltaPosI += factor*spikyGrad(posJI,supprotRadius);
+    }
+
+    // float deltaTemp = abs(particles[i].temperature-particles[i].lastTemperature);
+    // if(deltaTemp > 1000.1){
+    //     float3 jitterScale = float3(1.0f,4.0f,1.0f)*0.0011f;
+    //     jitterScale *= float3(sin(deltaTemp*2020.1126),frac(deltaTemp*1996.0324),cos(deltaTemp*1234.6789));
+    //     deltaPosI.xyz +=jitterScale.xyz ;
+    // }
+
+    particles[i].posDelta = deltaPosI/rho0;
+}
+
+[numthreads(NUM_THREADS_X,1,1)]
+void applyDeltaPos(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    if(i>=particleNum||particles[i].id>=MELTING_SOLID_ID) return;
+    particles[i].pos+=particles[i].posDelta;
+}
+
+[numthreads(NUM_THREADS_X,1,1)]
+void advectAttribute(uint3 id : SV_DispatchThreadID) // advect temperature
+{
+    int i = id.x;
+    if(i>=particleNum|| particles[i].id>=MELTING_SOLID_ID) return;
+    float4 posI = particles[i].pos;
+    float lastTI = particles[i].lastTemperature;
+    float lap = 0.0f;
+    for(int jj = 0;jj<nNum[i];jj++)
+    {
+        int j = nIndices[i*maxNumNeighbor+jj];
+        if(particles[j].id >= MELTING_SOLID_ID) continue;
+        float4 posJ = particles[j].pos;
+        float  lastTJ = particles[j].lastTemperature;
+        lap += spikyLaplace(length((posI-posJ).xyz),supprotRadius)*(lastTJ-lastTI);
+    }
+    particles[i].temperature = tConductRate*lap*timeStep/rho0 + lastTI;
+}
+
+[numthreads(NUM_THREADS_X,1,1)]
+void epilogue(uint3 id : SV_DispatchThreadID)
+{
+    int i = id.x;
+    if(i>=particleNum|| particles[i].id> MELTING_SOLID_ID ) return;
+    particles[i].lastTemperature = particles[i].temperature;
+    if(particles[i].id == MELTING_SOLID_ID ) return;
+    particles[i].pos = confinePosToBoundary(particles[i].pos);
+    particles[i].pos.w = 1.0f;
+    particles[i].vel = (particles[i].pos-particles[i].posLast)/timeStep;
+    particles[i].posLast = particles[i].pos;
+}
