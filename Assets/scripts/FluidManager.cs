@@ -349,8 +349,6 @@ public class FluidManager : MonoBehaviour
     {   
         if(renderParticle)
         {
-            Graphics.SetRenderTarget(rt_surfaceColor);
-            GL.Clear(true,true,Color.black);
             mat_helper.SetPass(5);
             Graphics.DrawProceduralNow(MeshTopology.Points,particleNum);
             return;
@@ -401,26 +399,12 @@ public class FluidManager : MonoBehaviour
         Graphics.Blit(rt_normal,rt_normalBlurred,mat_helper,7);
         mat_helper.SetFloat("horizontal",0.0f);
         Graphics.Blit(rt_normalBlurred,rt_normal,mat_helper,7);
-    }
-
-    public RenderTexture GetNormal()
-    {
-        return rt_normal;
-    }
-
-    public RenderTexture GetThickness()
-    {
-        return rt_thickness;
-    }
-
-    public RenderTexture GetColor()
-    {
-        return rt_surfaceColor;
-    }
-
-    public RenderTexture GetDepth()
-    {
-        return rt_depthBlurred;
+    
+        mat_particleSurface.SetTexture("_NormalTex",rt_normal);
+        mat_particleSurface.SetTexture("_ThicknessTex",rt_thickness);
+        mat_particleSurface.SetTexture("_ColoreTex",rt_surfaceColor);
+        mat_particleSurface.SetTexture("_DepthTex",rt_depthBlurred);
+        Graphics.Blit(null,null, mat_particleSurface);
     }
     void OnDestroy()
     {

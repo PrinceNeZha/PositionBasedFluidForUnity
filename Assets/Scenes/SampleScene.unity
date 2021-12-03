@@ -694,7 +694,6 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   mainSpeed: 100
-  fluidScript: {fileID: 2065949356}
 --- !u!1 &1082231269
 GameObject:
   m_ObjectHideFlags: 0
@@ -1320,7 +1319,7 @@ MonoBehaviour:
   surfaceColor: {r: 0, g: 0.6733866, b: 1, a: 0.12156863}
   rho0: 20
   transform_boundary: []
-  renderParticle: 1
+  renderParticle: 0
   renderTemperature: 0
 --- !u!4 &2065949357
 Transform:

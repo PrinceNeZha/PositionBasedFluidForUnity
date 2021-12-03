@@ -81,25 +81,4 @@ public class CameraController : MonoBehaviour {
         }
         return p_Velocity;
     }
-    public FluidManager fluidScript;
-
-    void OnRenderImage(RenderTexture src,RenderTexture dst)
-    {
-        RenderTexture rt_surfaceColor = fluidScript.GetColor();
-        mat_particleSurface.SetTexture("_ColoreTex",rt_surfaceColor);
-        if(fluidScript.renderParticle) 
-        {
-            Graphics.Blit(src,dst,mat_particleSurface,1);
-            return;
-        }
-        RenderTexture rt_normal = fluidScript.GetNormal();
-        RenderTexture rt_thickness = fluidScript.GetThickness();
-        RenderTexture rt_depthBlurred = fluidScript.GetDepth();
-        
-        mat_particleSurface.SetTexture("_NormalTex",rt_normal);
-        mat_particleSurface.SetTexture("_ThicknessTex",rt_thickness);
-        mat_particleSurface.SetTexture("_DepthTex",rt_depthBlurred);
-
-        Graphics.Blit(src,dst,mat_particleSurface,0);
-    }
 }
